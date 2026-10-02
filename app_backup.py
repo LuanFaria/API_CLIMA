@@ -1,0 +1,596 @@
+#!/usr/bin/env python3
+"""
+Luvics Clima no Ponto — API (Render / local)
+============================================
+Local:
+  pip install -r requirements.txt
+  python app.py
+  -> http://127.0.0.1:5050
+
+Render:
+  Start command: gunicorn app:app --timeout 120 --workers 1 --threads 2
+  Env vars: EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM
+
+IMPORTANTE: NÃO coloque senha de app no código. Use só Environment Variables no Render.
+Se a senha vazou no GitHub, revogue no Google e gere outra.
+"""
+
+from __future__ import annotations
+
+import concurrent.futures
+import io
+import math
+import os
+import smtplib
+import traceback
+from datetime import datetime, timedelta, timezone
+from email import encoders
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from pathlib import Path
+
+import requests
+from flask import Flask, jsonify, request, send_file, send_from_directory
+from flask_cors import CORS
+from fpdf import FPDF
+from PIL import Image, ImageDraw
+
+ROOT = Path(__file__).parent
+STATIC = ROOT / "static"
+OUTPUT = ROOT / "output"
+OUTPUT.mkdir(exist_ok=True)
+
+# =============================================================================
+# E-MAIL — use APENAS Environment Variables no Render (nunca hardcode senha).
+# =============================================================================
+EMAIL_CONFIG = {
+    "HOST": "smtp.gmail.com",
+    "PORT": 587,
+    "USER": "",  # deixe vazio; preencha via EMAIL_USER no Render
+    "PASS": "",  # deixe vazio; preencha via EMAIL_PASS no Render
+    "FROM": "",
+}
+# =============================================================================
+
+USER_AGENT = "TechLuvics-ClimaNoPonto/1.0 (contato@techluvics.com.br)"
+
+app = Flask(__name__, static_folder=str(STATIC), static_url_path="")
+CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+
+def ascii_safe(text) -> str:
+    if text is None:
+        return "-"
+    s = str(text)
+    repl = {
+        "—": "-", "–": "-", "−": "-",
+        "°": "C", "≤": "<=", "≥": ">=",
+        "á": "a", "à": "a", "ã": "a", "â": "a", "ä": "a",
+        "é": "e", "ê": "e", "è": "e",
+        "í": "i", "ì": "i",
+        "ó": "o", "ô": "o", "õ": "o", "ò": "o",
+        "ú": "u", "ù": "u", "ü": "u",
+        "ç": "c", "ñ": "n",
+        "Á": "A", "À": "A", "Ã": "A", "Â": "A",
+        "É": "E", "Ê": "E", "Í": "I",
+        "Ó": "O", "Ô": "O", "Õ": "O", "Ú": "U", "Ç": "C",
+        "•": "-", "·": "-",
+        """: '"', """: '"', "'": "'", "'": "'",
+    }
+    for a, b in repl.items():
+        s = s.replace(a, b)
+    return s.encode("latin-1", errors="replace").decode("latin-1")
+
+
+def _email_settings():
+    host = os.environ.get("EMAIL_HOST") or EMAIL_CONFIG.get("HOST") or "smtp.gmail.com"
+    port = int(os.environ.get("EMAIL_PORT") or EMAIL_CONFIG.get("PORT") or 587)
+    user = (os.environ.get("EMAIL_USER") or EMAIL_CONFIG.get("USER") or "").strip()
+    password = (os.environ.get("EMAIL_PASS") or EMAIL_CONFIG.get("PASS") or "").strip()
+    from_addr = (os.environ.get("EMAIL_FROM") or EMAIL_CONFIG.get("FROM") or user).strip()
+    if password.lower().startswith("xxxx"):
+        password = ""
+    return host, port, user, password, from_addr
+
+
+def email_configured() -> bool:
+    if (os.environ.get("RESEND_API_KEY") or "").strip():
+        return True
+    _, _, user, password, _ = _email_settings()
+    return bool(user and password)
+
+
+def _email_bodies(mode: str, lat: float, lon: float):
+    if mode == "free":
+        subject = "Seu relatorio GRATIS - Luvics Clima no Ponto"
+        body = (
+            "Ola!\n\n"
+            "Segue o relatorio GRATUITO do Luvics Clima no Ponto.\n"
+            f"Ponto: {lat:.6f}, {lon:.6f}\n\n"
+            "Esta versao inclui apenas temperatura atual e mapa de 1 km.\n"
+            "Para previsao completa, chuva, vento, historico e envio diario automatico:\n"
+            "assine a partir de R$ 9,90/mes (1 ponto).\n\n"
+            "5 pontos R$ 19,90 | 10 pontos R$ 29,90 | extra +R$ 5/ponto\n\n"
+            "Tech.luvics - Inteligencia de Ativos & IA\n"
+            "https://tech.luvics.com.br\n"
+        )
+    else:
+        subject = "Seu relatorio COMPLETO - Luvics Clima no Ponto"
+        body = (
+            "Ola!\n\n"
+            "Segue o relatorio COMPLETO (simulacao do plano pago).\n"
+            f"Ponto: {lat:.6f}, {lon:.6f}\n\n"
+            "Inclui previsao 7 dias, chuva, vento, umidade e historico.\n\n"
+            "Tech.luvics - Inteligencia de Ativos & IA\n"
+            "https://tech.luvics.com.br\n"
+        )
+    return subject, body
+
+
+def send_report_email_resend(to_email: str, pdf_bytes: bytes, filename: str, mode: str, lat: float, lon: float) -> None:
+    """Envia via API HTTPS da Resend (funciona no Render FREE; SMTP e bloqueado)."""
+    import base64
+    api_key = (os.environ.get("RESEND_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("RESEND_API_KEY nao definida")
+    from_addr = (
+        os.environ.get("EMAIL_FROM")
+        or os.environ.get("RESEND_FROM")
+        or "Luvics Clima <onboarding@resend.dev>"
+    ).strip()
+    subject, body = _email_bodies(mode, lat, lon)
+    payload = {
+        "from": from_addr,
+        "to": [to_email],
+        "subject": subject,
+        "text": body,
+        "attachments": [
+            {
+                "filename": filename,
+                "content": base64.b64encode(pdf_bytes).decode("ascii"),
+            }
+        ],
+    }
+    r = requests.post(
+        "https://api.resend.com/emails",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=30,
+    )
+    if r.status_code >= 400:
+        try:
+            detail = r.json()
+        except Exception:
+            detail = r.text[:300]
+        raise RuntimeError(f"Resend HTTP {r.status_code}: {detail}")
+
+
+def send_report_email_smtp(to_email: str, pdf_bytes: bytes, filename: str, mode: str, lat: float, lon: float) -> None:
+    """SMTP classico (Gmail etc). So funciona em plano PAGO do Render."""
+    host, port, user, password, from_addr = _email_settings()
+    if not user or not password:
+        raise RuntimeError("E-mail nao configurado. Defina EMAIL_USER e EMAIL_PASS no Render.")
+    subject, body = _email_bodies(mode, lat, lon)
+
+    msg = MIMEMultipart()
+    msg["From"] = from_addr
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+
+    part = MIMEBase("application", "pdf")
+    part.set_payload(pdf_bytes)
+    encoders.encode_base64(part)
+    part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
+    msg.attach(part)
+
+    with smtplib.SMTP(host, port, timeout=20) as server:
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(user, password)
+        server.sendmail(from_addr, [to_email], msg.as_string())
+
+
+def send_report_email(to_email: str, pdf_bytes: bytes, filename: str, mode: str, lat: float, lon: float) -> None:
+    if not to_email or "@" not in to_email:
+        raise RuntimeError("E-mail do destinatario invalido.")
+    # Preferir Resend (HTTPS) no free; SMTP so se nao houver chave Resend
+    if (os.environ.get("RESEND_API_KEY") or "").strip():
+        send_report_email_resend(to_email, pdf_bytes, filename, mode, lat, lon)
+        return
+    send_report_email_smtp(to_email, pdf_bytes, filename, mode, lat, lon)
+
+
+def weather_code_label(code):
+    table = {
+        0: "Ceu limpo", 1: "Principalmente limpo", 2: "Parcialmente nublado", 3: "Nublado",
+        45: "Nevoeiro", 48: "Nevoeiro", 51: "Garoa fraca", 61: "Chuva fraca",
+        63: "Chuva moderada", 65: "Chuva forte", 80: "Pancadas", 95: "Trovoada",
+    }
+    try:
+        return table.get(int(code), f"Codigo {code}")
+    except Exception:
+        return "-"
+
+
+def fetch_climate(lat: float, lon: float) -> dict:
+    fc = requests.get(
+        "https://api.open-meteo.com/v1/forecast",
+        params={
+            "latitude": lat,
+            "longitude": lon,
+            "current": "temperature_2m,relative_humidity_2m,precipitation,weather_code,wind_speed_10m",
+            "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,wind_speed_10m_max",
+            "timezone": "America/Sao_Paulo",
+            "forecast_days": 7,
+        },
+        timeout=20,
+        headers={"User-Agent": USER_AGENT},
+    )
+    fc.raise_for_status()
+    forecast = fc.json()
+
+    end = datetime.now(timezone.utc).date() - timedelta(days=1)
+    start = end - timedelta(days=30)
+    hist = {}
+    try:
+        ha = requests.get(
+            "https://archive-api.open-meteo.com/v1/archive",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "start_date": start.isoformat(),
+                "end_date": end.isoformat(),
+                "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum",
+                "timezone": "America/Sao_Paulo",
+            },
+            timeout=20,
+            headers={"User-Agent": USER_AGENT},
+        )
+        if ha.status_code == 200:
+            hist = ha.json()
+    except Exception:
+        pass
+    return {"forecast": forecast, "history": hist}
+
+
+def summarize(data: dict) -> dict:
+    fc = data.get("forecast") or {}
+    cur = fc.get("current") or {}
+    daily = fc.get("daily") or {}
+    hist = (data.get("history") or {}).get("daily") or {}
+    s = {
+        "temp_now": cur.get("temperature_2m"),
+        "humidity": cur.get("relative_humidity_2m"),
+        "precip_now": cur.get("precipitation"),
+        "wind": cur.get("wind_speed_10m"),
+        "weather": weather_code_label(cur.get("weather_code")),
+        "days": [],
+        "hist_tmin": None,
+        "hist_tmax": None,
+        "hist_precip": None,
+        "nights_cold": 0,
+    }
+    times = daily.get("time") or []
+    for i, day in enumerate(times):
+        s["days"].append({
+            "date": day,
+            "tmax": (daily.get("temperature_2m_max") or [None])[i],
+            "tmin": (daily.get("temperature_2m_min") or [None])[i],
+            "precip": (daily.get("precipitation_sum") or [None])[i],
+            "pop": (daily.get("precipitation_probability_max") or [None])[i],
+            "wind": (daily.get("wind_speed_10m_max") or [None])[i],
+        })
+    tmin_h = [v for v in (hist.get("temperature_2m_min") or []) if v is not None]
+    tmax_h = [v for v in (hist.get("temperature_2m_max") or []) if v is not None]
+    pr_h = [v for v in (hist.get("precipitation_sum") or []) if v is not None]
+    if tmin_h:
+        s["hist_tmin"] = min(tmin_h)
+        s["nights_cold"] = sum(1 for v in tmin_h if v <= 5)
+    if tmax_h:
+        s["hist_tmax"] = max(tmax_h)
+    if pr_h:
+        s["hist_precip"] = round(sum(pr_h), 1)
+    return s
+
+
+def _placeholder_map(lat: float, lon: float, radius_m: int, path: Path) -> Path:
+    """Mapa local sem rede — evita timeout no Render free."""
+    img = Image.new("RGB", (800, 500), (241, 245, 249))
+    d = ImageDraw.Draw(img)
+    d.rectangle([0, 0, 799, 499], outline=(15, 23, 42), width=2)
+    cx, cy = 400, 250
+    r_px = 140
+    d.ellipse([cx - r_px, cy - r_px, cx + r_px, cy + r_px], outline=(11, 70, 36), width=3)
+    d.ellipse([cx - 8, cy - 8, cx + 8, cy + 8], fill=(225, 29, 72))
+    for x in range(50, 800, 50):
+        d.line([(x, 0), (x, 500)], fill=(226, 232, 240), width=1)
+    for y in range(50, 500, 50):
+        d.line([(0, y), (800, y)], fill=(226, 232, 240), width=1)
+    d.rectangle([10, 10, 420, 58], fill=(255, 255, 255), outline=(20, 20, 20))
+    d.text((18, 18), f"Raio {radius_m} m | {lat:.5f}, {lon:.5f}", fill=(0, 0, 0))
+    d.text((18, 38), "Mapa de referencia (sem tiles externos)", fill=(100, 116, 139))
+    img.save(str(path))
+    return path
+
+
+def _staticmap_render(lat: float, lon: float, radius_m: int, path: Path) -> Path:
+    from staticmap import CircleMarker, Line, StaticMap
+
+    m = StaticMap(800, 500, url_template="https://tile.openstreetmap.org/{z}/{x}/{y}.png")
+    n = 32
+    pts = []
+    for i in range(n + 1):
+        ang = 2 * math.pi * i / n
+        dlat = (radius_m / 111320.0) * math.cos(ang)
+        dlon = (radius_m / (111320.0 * math.cos(math.radians(lat)))) * math.sin(ang)
+        pts.append((lon + dlon, lat + dlat))
+    for i in range(len(pts) - 1):
+        m.add_line(Line([pts[i], pts[i + 1]], "#0B4624", 2))
+    m.add_marker(CircleMarker((lon, lat), "#E11D48", 14))
+    img = m.render(zoom=13)
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([10, 10, 280, 48], fill=(255, 255, 255), outline=(20, 20, 20))
+    draw.text((18, 18), f"Raio 1 km | {lat:.5f}, {lon:.5f}", fill=(0, 0, 0))
+    img.save(str(path))
+    return path
+
+
+def make_map_png(lat: float, lon: float, radius_m: int = 1000) -> Path:
+    path = OUTPUT / f"map_{lat:.4f}_{lon:.4f}_{radius_m}.png"
+    use_static = os.environ.get("USE_STATICMAP", "0").strip().lower() in ("1", "true", "yes")
+
+    if use_static:
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(_staticmap_render, lat, lon, radius_m, path)
+                return fut.result(timeout=12)
+        except Exception:
+            return _placeholder_map(lat, lon, radius_m, path)
+
+    return _placeholder_map(lat, lon, radius_m, path)
+
+
+def _cell(pdf, text, ln=1, bold=False, size=10, center=False):
+    pdf.set_font("Helvetica", "B" if bold else "", size)
+    pdf.cell(0, 5 if size <= 10 else 7, ascii_safe(text), ln=ln, align="C" if center else "L")
+
+
+def build_pdf_free(lat, lon, email, summary, map_path: Path) -> bytes:
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=14)
+    pdf.add_page()
+    _cell(pdf, "Tech.luvics | Luvics Clima no Ponto", bold=True, size=14, center=True)
+    _cell(pdf, "VERSAO GRATUITA (limitada)", bold=True, size=11, center=True)
+    _cell(pdf, datetime.now().strftime("%d/%m/%Y %H:%M"), size=9, center=True)
+    pdf.ln(4)
+
+    _cell(pdf, "1. Seu ponto", bold=True, size=12)
+    _cell(pdf, f"Latitude:  {lat:.6f}")
+    _cell(pdf, f"Longitude: {lon:.6f}")
+    if email:
+        _cell(pdf, f"E-mail informado: {email}")
+    pdf.ln(2)
+
+    _cell(pdf, "2. O que voce recebe no plano gratis", bold=True, size=12)
+    _cell(pdf, f"Temperatura atual no ponto: {summary.get('temp_now')} C", bold=True, size=12)
+    _cell(pdf, f"Condicao (resumo): {summary.get('weather')}")
+    pdf.ln(2)
+
+    _cell(pdf, "3. Mapa de referencia (raio 1 km)", bold=True, size=12)
+    if map_path.exists():
+        pdf.image(str(map_path), w=180)
+    pdf.ln(3)
+
+    pdf.set_fill_color(255, 247, 237)
+    pdf.rect(10, pdf.get_y(), 190, 52, style="F")
+    y = pdf.get_y() + 4
+    pdf.set_xy(14, y)
+    _cell(pdf, "ESTE RELATORIO ESTA INCOMPLETO DE PROPOSITO", bold=True, size=11)
+    pdf.set_x(14)
+    _cell(pdf, "No plano gratis voce ve apenas temperatura atual + mapa da regiao.")
+    pdf.set_x(14)
+    _cell(pdf, "Bloqueado: previsao 7 dias, chuva, vento, umidade, historico 30 dias,")
+    pdf.set_x(14)
+    _cell(pdf, "alertas de frio e envio automatico todo dia no seu e-mail.")
+    pdf.set_x(14)
+    _cell(pdf, "Desbloqueie a partir de R$ 9,90/mes (1 ponto diario).", bold=True)
+    pdf.set_x(14)
+    _cell(pdf, "5 pontos R$ 19,90 | 10 pontos R$ 29,90 | extra +R$ 5/ponto")
+    pdf.ln(8)
+
+    _cell(pdf, "4. Fontes", bold=True, size=12)
+    pdf.multi_cell(
+        0, 4.5,
+        ascii_safe(
+            "Open-Meteo (clima). OpenStreetMap (mapa e busca). "
+            "Material orientativo - nao substitui ART ou laudo agronomico oficial. tech.luvics.com.br"
+        ),
+    )
+
+    buf = io.BytesIO()
+    pdf.output(buf)
+    return buf.getvalue()
+
+
+def build_pdf_full(lat, lon, email, summary, map_path: Path) -> bytes:
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=14)
+    pdf.add_page()
+    _cell(pdf, "Tech.luvics | Luvics Clima no Ponto", bold=True, size=14, center=True)
+    _cell(pdf, "RELATORIO COMPLETO (plano pago - simulacao de teste)", bold=True, size=11, center=True)
+    _cell(pdf, datetime.now().strftime("%d/%m/%Y %H:%M"), size=9, center=True)
+    pdf.ln(3)
+
+    _cell(pdf, "1. Ponto monitorado", bold=True, size=12)
+    _cell(pdf, f"Lat {lat:.6f} | Lon {lon:.6f}")
+    if email:
+        _cell(pdf, f"E-mail: {email}")
+    pdf.ln(2)
+
+    _cell(pdf, "2. Condicao atual", bold=True, size=12)
+    _cell(pdf, f"Temperatura: {summary.get('temp_now')} C")
+    _cell(pdf, f"Umidade: {summary.get('humidity')} %")
+    _cell(pdf, f"Precipitacao (agora): {summary.get('precip_now')} mm")
+    _cell(pdf, f"Vento: {summary.get('wind')} km/h")
+    _cell(pdf, f"Condicao: {summary.get('weather')}")
+    pdf.ln(2)
+
+    _cell(pdf, "3. Previsao 7 dias", bold=True, size=12)
+    for d in summary.get("days") or []:
+        _cell(
+            pdf,
+            f"{d['date']}: Tmin {d['tmin']}C | Tmax {d['tmax']}C | "
+            f"Chuva {d['precip']}mm | Prob {d['pop']}% | Vento {d['wind']}km/h",
+            size=9,
+        )
+    pdf.ln(2)
+
+    _cell(pdf, "4. Historico 30 dias", bold=True, size=12)
+    _cell(pdf, f"Tmin observada: {summary.get('hist_tmin')} C")
+    _cell(pdf, f"Tmax observada: {summary.get('hist_tmax')} C")
+    _cell(pdf, f"Chuva acumulada: {summary.get('hist_precip')} mm")
+    _cell(pdf, f"Noites com Tmin <= 5C: {summary.get('nights_cold')}")
+    pdf.ln(2)
+
+    _cell(pdf, "5. Mapa (raio 1 km)", bold=True, size=12)
+    if map_path.exists():
+        pdf.image(str(map_path), w=180)
+    pdf.ln(2)
+
+    _cell(pdf, "6. Interpretacao orientativa", bold=True, size=12)
+    pdf.multi_cell(
+        0, 4.5,
+        ascii_safe(
+            "Dados de modelo meteorologico de superficie (Open-Meteo). "
+            "Use como apoio operacional no ponto (sede/talhao). "
+            "Nao substitui laudo agronomico, ART ou cobertura de seguro. "
+            "Em risco de frio, combine com observacao local e vento calmo."
+        ),
+    )
+    pdf.ln(2)
+    _cell(pdf, "tech.luvics.com.br | Inteligencia de Ativos & IA", bold=True, size=9)
+
+    buf = io.BytesIO()
+    pdf.output(buf)
+    return buf.getvalue()
+
+
+@app.get("/api/health")
+def api_health():
+    return jsonify({"ok": True, "service": "luvics-clima", "email": email_configured()})
+
+
+@app.get("/api/email-status")
+def api_email_status():
+    host, port, user, password, _ = _email_settings()
+    return jsonify({
+        "configured": bool(user and password),
+        "host": host,
+        "port": port,
+        "user": (user[:3] + "***") if user else "",
+    })
+
+
+@app.get("/api/geocode")
+def api_geocode():
+    q = (request.args.get("q") or "").strip()
+    if len(q) < 3:
+        return jsonify({"results": []})
+    r = requests.get(
+        "https://nominatim.openstreetmap.org/search",
+        params={"q": q, "format": "json", "limit": 5, "countrycodes": "br", "addressdetails": 1},
+        headers={"User-Agent": USER_AGENT},
+        timeout=20,
+    )
+    r.raise_for_status()
+    results = [
+        {"display": i.get("display_name", ""), "lat": float(i["lat"]), "lon": float(i["lon"])}
+        for i in r.json()
+    ]
+    return jsonify({"results": results})
+
+
+@app.post("/api/report")
+def api_report():
+    body = request.get_json(force=True, silent=True) or {}
+    try:
+        lat = float(body.get("lat"))
+        lon = float(body.get("lon"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "lat/lon invalidos"}), 400
+    email = (body.get("email") or "").strip()
+    mode = (body.get("mode") or "free").lower()
+    if mode not in ("free", "full"):
+        mode = "free"
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            fut_climate = ex.submit(fetch_climate, lat, lon)
+            fut_map = ex.submit(make_map_png, lat, lon, 1000)
+            raw = fut_climate.result(timeout=25)
+            map_path = fut_map.result(timeout=15)
+
+        summary = summarize(raw)
+        if mode == "free":
+            pdf_bytes = build_pdf_free(lat, lon, email, summary, map_path)
+            fname = "luvics_clima_GRATIS.pdf"
+        else:
+            pdf_bytes = build_pdf_full(lat, lon, email, summary, map_path)
+            fname = "luvics_clima_COMPLETO.pdf"
+
+        try:
+            (OUTPUT / f"{mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf").write_bytes(pdf_bytes)
+        except Exception:
+            pass
+
+        emailed = False
+        email_error = None
+        if email:
+            if not email_configured():
+                email_error = (
+                    "E-mail do destinatario ok, mas SMTP nao configurado. "
+                    "Defina EMAIL_USER e EMAIL_PASS no Render."
+                )
+            else:
+                try:
+                    send_report_email(email, pdf_bytes, fname, mode, lat, lon)
+                    emailed = True
+                except Exception as mail_err:
+                    email_error = str(mail_err)[:200]
+
+        resp = send_file(
+            io.BytesIO(pdf_bytes),
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name=fname,
+        )
+        resp.headers["X-Luvics-Emailed"] = "1" if emailed else "0"
+        if email_error:
+            resp.headers["X-Luvics-Email-Error"] = email_error[:200]
+        resp.headers["Access-Control-Expose-Headers"] = "X-Luvics-Emailed, X-Luvics-Email-Error"
+        return resp
+    except Exception as e:
+        tb = traceback.format_exc()
+        app.logger.error("report failed: %s\n%s", e, tb)
+        return jsonify({"error": str(e), "type": type(e).__name__}), 500
+
+
+@app.get("/")
+def index():
+    return send_from_directory(STATIC, "index.html")
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5050))
+    print("=" * 60)
+    print("Luvics Clima no Ponto")
+    print(f"Local: http://127.0.0.1:{port}")
+    print(f"E-mail configurado: {email_configured()}")
+    print("=" * 60)
+    app.run(host="0.0.0.0", port=port, debug=False)
