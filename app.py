@@ -42,11 +42,11 @@ OUTPUT.mkdir(exist_ok=True)
 # Localmente pode preencher aqui OU usar env.
 # =============================================================================
 EMAIL_CONFIG = {
-    "HOST": "smtp.gmail.com",
-    "PORT": 587,
-    "USER": "techluvics@gmail.com",  # ex: seu@gmail.com
-    "PASS": "qnyx mmfx bgsb nymw",  # senha de app
-    "FROM": "techluvics@gmail.com",
+    "HOST": "",
+    "PORT": ,
+    "USER": "",  # ex: seu@gmail.com
+    "PASS": "",  # senha de app
+    "FROM": "",
 }
 # =============================================================================
 
