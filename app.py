@@ -44,9 +44,9 @@ OUTPUT.mkdir(exist_ok=True)
 EMAIL_CONFIG = {
     "HOST": "smtp.gmail.com",
     "PORT": 587,
-    "USER": "",  # ex: seu@gmail.com
-    "PASS": "",  # senha de app
-    "FROM": "",
+    "USER": "techluvics@gmail.com",  # ex: seu@gmail.com
+    "PASS": "qnyx mmfx bgsb nymw",  # senha de app
+    "FROM": "techluvics@gmail.com",
 }
 # =============================================================================
 
