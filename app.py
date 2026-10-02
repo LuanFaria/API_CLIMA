@@ -95,17 +95,13 @@ def _email_settings():
 
 
 def email_configured() -> bool:
+    if (os.environ.get("RESEND_API_KEY") or "").strip():
+        return True
     _, _, user, password, _ = _email_settings()
     return bool(user and password)
 
 
-def send_report_email(to_email: str, pdf_bytes: bytes, filename: str, mode: str, lat: float, lon: float) -> None:
-    host, port, user, password, from_addr = _email_settings()
-    if not user or not password:
-        raise RuntimeError("E-mail nao configurado. Defina EMAIL_USER e EMAIL_PASS no Render.")
-    if not to_email or "@" not in to_email:
-        raise RuntimeError("E-mail do destinatario invalido.")
-
+def _email_bodies(mode: str, lat: float, lon: float):
     if mode == "free":
         subject = "Seu relatorio GRATIS - Luvics Clima no Ponto"
         body = (
@@ -129,6 +125,56 @@ def send_report_email(to_email: str, pdf_bytes: bytes, filename: str, mode: str,
             "Tech.luvics - Inteligencia de Ativos & IA\n"
             "https://tech.luvics.com.br\n"
         )
+    return subject, body
+
+
+def send_report_email_resend(to_email: str, pdf_bytes: bytes, filename: str, mode: str, lat: float, lon: float) -> None:
+    """Envia via API HTTPS da Resend (funciona no Render FREE; SMTP e bloqueado)."""
+    import base64
+    api_key = (os.environ.get("RESEND_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("RESEND_API_KEY nao definida")
+    from_addr = (
+        os.environ.get("EMAIL_FROM")
+        or os.environ.get("RESEND_FROM")
+        or "Luvics Clima <onboarding@resend.dev>"
+    ).strip()
+    subject, body = _email_bodies(mode, lat, lon)
+    payload = {
+        "from": from_addr,
+        "to": [to_email],
+        "subject": subject,
+        "text": body,
+        "attachments": [
+            {
+                "filename": filename,
+                "content": base64.b64encode(pdf_bytes).decode("ascii"),
+            }
+        ],
+    }
+    r = requests.post(
+        "https://api.resend.com/emails",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=30,
+    )
+    if r.status_code >= 400:
+        try:
+            detail = r.json()
+        except Exception:
+            detail = r.text[:300]
+        raise RuntimeError(f"Resend HTTP {r.status_code}: {detail}")
+
+
+def send_report_email_smtp(to_email: str, pdf_bytes: bytes, filename: str, mode: str, lat: float, lon: float) -> None:
+    """SMTP classico (Gmail etc). So funciona em plano PAGO do Render."""
+    host, port, user, password, from_addr = _email_settings()
+    if not user or not password:
+        raise RuntimeError("E-mail nao configurado. Defina EMAIL_USER e EMAIL_PASS no Render.")
+    subject, body = _email_bodies(mode, lat, lon)
 
     msg = MIMEMultipart()
     msg["From"] = from_addr
@@ -148,6 +194,16 @@ def send_report_email(to_email: str, pdf_bytes: bytes, filename: str, mode: str,
         server.ehlo()
         server.login(user, password)
         server.sendmail(from_addr, [to_email], msg.as_string())
+
+
+def send_report_email(to_email: str, pdf_bytes: bytes, filename: str, mode: str, lat: float, lon: float) -> None:
+    if not to_email or "@" not in to_email:
+        raise RuntimeError("E-mail do destinatario invalido.")
+    # Preferir Resend (HTTPS) no free; SMTP so se nao houver chave Resend
+    if (os.environ.get("RESEND_API_KEY") or "").strip():
+        send_report_email_resend(to_email, pdf_bytes, filename, mode, lat, lon)
+        return
+    send_report_email_smtp(to_email, pdf_bytes, filename, mode, lat, lon)
 
 
 def weather_code_label(code):
