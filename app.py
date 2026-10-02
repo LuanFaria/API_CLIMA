@@ -487,11 +487,16 @@ def index():
     return send_from_directory(STATIC, "index.html")
 
 
+#if __name__ == "__main__":
+#    port = int(os.environ.get("PORT", 5050))
+#    print("=" * 60)
+#    print("Luvics Clima no Ponto")
+#    print(f"Local: http://127.0.0.1:{port}")
+#    print(f"E-mail configurado: {email_configured()}")
+#    print("=" * 60)
+#    app.run(host="0.0.0.0", port=port, debug=False)
+
 if __name__ == "__main__":
+    import os
     port = int(os.environ.get("PORT", 5050))
-    print("=" * 60)
-    print("Luvics Clima no Ponto")
-    print(f"Local: http://127.0.0.1:{port}")
-    print(f"E-mail configurado: {email_configured()}")
-    print("=" * 60)
     app.run(host="0.0.0.0", port=port, debug=False)
