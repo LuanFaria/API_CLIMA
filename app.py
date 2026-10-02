@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 Luvics Clima no Ponto — API (Render / local)
@@ -299,61 +300,142 @@ def summarize(data: dict) -> dict:
     return s
 
 
-def _placeholder_map(lat: float, lon: float, radius_m: int, path: Path) -> Path:
-    """Mapa local sem rede — evita timeout no Render free."""
+
+def _deg2num(lat_deg: float, lon_deg: float, zoom: int):
+    lat_rad = math.radians(lat_deg)
+    n = 2.0 ** zoom
+    xtile = int((lon_deg + 180.0) / 360.0 * n)
+    ytile = int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
+    return xtile, ytile
+
+
+def _num2deg(xtile: float, ytile: float, zoom: int):
+    n = 2.0 ** zoom
+    lon_deg = xtile / n * 360.0 - 180.0
+    lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * ytile / n)))
+    lat_deg = math.degrees(lat_rad)
+    return lat_deg, lon_deg
+
+
+def _fetch_tile(z: int, x: int, y: int) -> Image.Image | None:
+    """Baixa 1 tile OSM. User-Agent obrigatorio."""
+    urls = [
+        f"https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        f"https://a.tile.openstreetmap.fr/osmfr/{z}/{x}/{y}.png",
+    ]
+    for url in urls:
+        try:
+            r = requests.get(
+                url,
+                timeout=6,
+                headers={"User-Agent": USER_AGENT},
+            )
+            if r.status_code == 200 and len(r.content) > 500:
+                return Image.open(io.BytesIO(r.content)).convert("RGB")
+        except Exception:
+            continue
+    return None
+
+
+def _basemap_from_tiles(lat: float, lon: float, zoom: int = 14, grid: int = 3) -> Image.Image | None:
+    """
+    Monta basemap real com grid 3x3 de tiles OSM (~9 requests, paralelo).
+    Rápido o bastante para o free do Render.
+    """
+    cx, cy = _deg2num(lat, lon, zoom)
+    half = grid // 2
+    tile_size = 256
+    canvas = Image.new("RGB", (tile_size * grid, tile_size * grid), (230, 230, 230))
+
+    jobs = []
+    for dy in range(-half, half + 1):
+        for dx in range(-half, half + 1):
+            jobs.append((dx, dy, cx + dx, cy + dy))
+
+    def work(item):
+        dx, dy, tx, ty = item
+        img = _fetch_tile(zoom, tx, ty)
+        return dx, dy, img
+
+    ok = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        for dx, dy, img in ex.map(work, jobs):
+            if img is None:
+                continue
+            px = (dx + half) * tile_size
+            py = (dy + half) * tile_size
+            canvas.paste(img, (px, py))
+            ok += 1
+
+    if ok < 3:
+        return None
+
+    # Posicao do ponto dentro do canvas
+    # centro do tile (cx,cy) esta no meio do canvas
+    n = 2.0 ** zoom
+    # fracao dentro do tile central
+    x_frac = ((lon + 180.0) / 360.0 * n) - cx
+    y_frac = ((1.0 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2.0 * n) - cy
+    px = int((half + x_frac) * tile_size)
+    py = int((half + y_frac) * tile_size)
+
+    draw = ImageDraw.Draw(canvas)
+    # Circulo ~1km em pixels (aprox na lat)
+    # 1 deg lat ~ 111320 m; tile width in deg:
+    tile_deg = 360.0 / n
+    meters_per_px = (tile_deg * 111320.0 * math.cos(math.radians(lat))) / tile_size
+    r_px = max(20, int(1000.0 / meters_per_px)) if meters_per_px > 0 else 40
+    draw.ellipse([px - r_px, py - r_px, px + r_px, py + r_px], outline=(11, 70, 36), width=3)
+    # Marcador
+    draw.ellipse([px - 9, py - 9, px + 9, py + 9], fill=(225, 29, 72), outline=(255, 255, 255), width=2)
+
+    # Redimensiona para 800x500 (crop center se preciso)
+    w, h = canvas.size
+    target_w, target_h = 800, 500
+    scale = max(target_w / w, target_h / h)
+    nw, nh = int(w * scale), int(h * scale)
+    canvas = canvas.resize((nw, nh), Image.Resampling.BILINEAR)
+    left = (nw - target_w) // 2
+    top = (nh - target_h) // 2
+    canvas = canvas.crop((left, top, left + target_w, top + target_h))
+
+    draw = ImageDraw.Draw(canvas)
+    draw.rectangle([8, 8, 360, 52], fill=(255, 255, 255), outline=(30, 30, 30))
+    draw.text((16, 16), f"Raio 1 km | {lat:.5f}, {lon:.5f}", fill=(0, 0, 0))
+    draw.text((16, 34), "OpenStreetMap · Luvics Clima no Ponto", fill=(80, 80, 80))
+    return canvas
+
+
+def _placeholder_map_img(lat: float, lon: float, radius_m: int = 1000) -> Image.Image:
     img = Image.new("RGB", (800, 500), (241, 245, 249))
     d = ImageDraw.Draw(img)
     d.rectangle([0, 0, 799, 499], outline=(15, 23, 42), width=2)
-    cx, cy = 400, 250
-    r_px = 140
-    d.ellipse([cx - r_px, cy - r_px, cx + r_px, cy + r_px], outline=(11, 70, 36), width=3)
-    d.ellipse([cx - 8, cy - 8, cx + 8, cy + 8], fill=(225, 29, 72))
     for x in range(50, 800, 50):
         d.line([(x, 0), (x, 500)], fill=(226, 232, 240), width=1)
     for y in range(50, 500, 50):
         d.line([(0, y), (800, y)], fill=(226, 232, 240), width=1)
-    d.rectangle([10, 10, 420, 58], fill=(255, 255, 255), outline=(20, 20, 20))
+    cx, cy, r_px = 400, 250, 140
+    d.ellipse([cx - r_px, cy - r_px, cx + r_px, cy + r_px], outline=(11, 70, 36), width=3)
+    d.ellipse([cx - 8, cy - 8, cx + 8, cy + 8], fill=(225, 29, 72))
+    d.rectangle([10, 10, 480, 58], fill=(255, 255, 255), outline=(20, 20, 20))
     d.text((18, 18), f"Raio {radius_m} m | {lat:.5f}, {lon:.5f}", fill=(0, 0, 0))
-    d.text((18, 38), "Mapa de referencia (sem tiles externos)", fill=(100, 116, 139))
-    img.save(str(path))
-    return path
-
-
-def _staticmap_render(lat: float, lon: float, radius_m: int, path: Path) -> Path:
-    from staticmap import CircleMarker, Line, StaticMap
-
-    m = StaticMap(800, 500, url_template="https://tile.openstreetmap.org/{z}/{x}/{y}.png")
-    n = 32
-    pts = []
-    for i in range(n + 1):
-        ang = 2 * math.pi * i / n
-        dlat = (radius_m / 111320.0) * math.cos(ang)
-        dlon = (radius_m / (111320.0 * math.cos(math.radians(lat)))) * math.sin(ang)
-        pts.append((lon + dlon, lat + dlat))
-    for i in range(len(pts) - 1):
-        m.add_line(Line([pts[i], pts[i + 1]], "#0B4624", 2))
-    m.add_marker(CircleMarker((lon, lat), "#E11D48", 14))
-    img = m.render(zoom=13)
-    draw = ImageDraw.Draw(img)
-    draw.rectangle([10, 10, 280, 48], fill=(255, 255, 255), outline=(20, 20, 20))
-    draw.text((18, 18), f"Raio 1 km | {lat:.5f}, {lon:.5f}", fill=(0, 0, 0))
-    img.save(str(path))
-    return path
+    d.text((18, 38), "Basemap indisponivel (fallback local)", fill=(100, 116, 139))
+    return img
 
 
 def make_map_png(lat: float, lon: float, radius_m: int = 1000) -> Path:
     path = OUTPUT / f"map_{lat:.4f}_{lon:.4f}_{radius_m}.png"
-    use_static = os.environ.get("USE_STATICMAP", "0").strip().lower() in ("1", "true", "yes")
-
-    if use_static:
-        try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                fut = ex.submit(_staticmap_render, lat, lon, radius_m, path)
-                return fut.result(timeout=12)
-        except Exception:
-            return _placeholder_map(lat, lon, radius_m, path)
-
-    return _placeholder_map(lat, lon, radius_m, path)
+    img = None
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_basemap_from_tiles, lat, lon, 14, 3)
+            img = fut.result(timeout=14)
+    except Exception:
+        img = None
+    if img is None:
+        img = _placeholder_map_img(lat, lon, radius_m)
+    img.save(str(path), format="PNG", optimize=True)
+    return path
 
 
 def _cell(pdf, text, ln=1, bold=False, size=10, center=False):
@@ -361,57 +443,111 @@ def _cell(pdf, text, ln=1, bold=False, size=10, center=False):
     pdf.cell(0, 5 if size <= 10 else 7, ascii_safe(text), ln=ln, align="C" if center else "L")
 
 
+def _fmt(v, suffix="", digits=1):
+    if v is None:
+        return "-"
+    try:
+        if isinstance(v, (int, float)):
+            return f"{float(v):.{digits}f}{suffix}"
+        return f"{v}{suffix}"
+    except Exception:
+        return "-"
+
+
+def _header_bar(pdf, title: str, subtitle: str):
+    pdf.set_fill_color(11, 70, 36)
+    pdf.rect(0, 0, 210, 28, style="F")
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_xy(12, 6)
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 7, ascii_safe(title), ln=1)
+    pdf.set_x(12)
+    pdf.set_font("Helvetica", "", 9)
+    pdf.cell(0, 5, ascii_safe(subtitle), ln=1)
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_y(32)
+
+
+def _kv_row(pdf, label: str, value: str, label_w=55):
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(label_w, 6, ascii_safe(label), ln=0)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 6, ascii_safe(value), ln=1)
+
+
 def build_pdf_free(lat, lon, email, summary, map_path: Path) -> bytes:
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=14)
     pdf.add_page()
-    _cell(pdf, "Tech.luvics | Luvics Clima no Ponto", bold=True, size=14, center=True)
-    _cell(pdf, "VERSAO GRATUITA (limitada)", bold=True, size=11, center=True)
-    _cell(pdf, datetime.now().strftime("%d/%m/%Y %H:%M"), size=9, center=True)
-    pdf.ln(4)
-
-    _cell(pdf, "1. Seu ponto", bold=True, size=12)
-    _cell(pdf, f"Latitude:  {lat:.6f}")
-    _cell(pdf, f"Longitude: {lon:.6f}")
-    if email:
-        _cell(pdf, f"E-mail informado: {email}")
-    pdf.ln(2)
-
-    _cell(pdf, "2. O que voce recebe no plano gratis", bold=True, size=12)
-    _cell(pdf, f"Temperatura atual no ponto: {summary.get('temp_now')} C", bold=True, size=12)
-    _cell(pdf, f"Condicao (resumo): {summary.get('weather')}")
-    pdf.ln(2)
-
-    _cell(pdf, "3. Mapa de referencia (raio 1 km)", bold=True, size=12)
-    if map_path.exists():
-        pdf.image(str(map_path), w=180)
-    pdf.ln(3)
+    now = datetime.now().strftime("%d/%m/%Y %H:%M")
+    _header_bar(
+        pdf,
+        "Tech.luvics | Luvics Clima no Ponto",
+        f"RELATORIO GRATUITO  ·  {now}  ·  tech.luvics.com.br",
+    )
 
     pdf.set_fill_color(255, 247, 237)
-    pdf.rect(10, pdf.get_y(), 190, 52, style="F")
-    y = pdf.get_y() + 4
-    pdf.set_xy(14, y)
-    _cell(pdf, "ESTE RELATORIO ESTA INCOMPLETO DE PROPOSITO", bold=True, size=11)
-    pdf.set_x(14)
-    _cell(pdf, "No plano gratis voce ve apenas temperatura atual + mapa da regiao.")
-    pdf.set_x(14)
-    _cell(pdf, "Bloqueado: previsao 7 dias, chuva, vento, umidade, historico 30 dias,")
-    pdf.set_x(14)
-    _cell(pdf, "alertas de frio e envio automatico todo dia no seu e-mail.")
-    pdf.set_x(14)
-    _cell(pdf, "Desbloqueie a partir de R$ 9,90/mes (1 ponto diario).", bold=True)
-    pdf.set_x(14)
-    _cell(pdf, "5 pontos R$ 19,90 | 10 pontos R$ 29,90 | extra +R$ 5/ponto")
-    pdf.ln(8)
+    pdf.rect(12, pdf.get_y(), 186, 12, style="F")
+    pdf.set_xy(14, pdf.get_y() + 3)
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.set_text_color(180, 83, 9)
+    pdf.cell(0, 5, ascii_safe("VERSAO GRATUITA — conteudo limitado (teste). Desbloqueie o plano completo a partir de R$ 9,90/mes."), ln=1)
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(4)
 
-    _cell(pdf, "4. Fontes", bold=True, size=12)
-    pdf.multi_cell(
-        0, 4.5,
-        ascii_safe(
-            "Open-Meteo (clima). OpenStreetMap (mapa e busca). "
-            "Material orientativo - nao substitui ART ou laudo agronomico oficial. tech.luvics.com.br"
-        ),
-    )
+    _cell(pdf, "1. Ponto monitorado", bold=True, size=12)
+    _kv_row(pdf, "Latitude", f"{lat:.6f}")
+    _kv_row(pdf, "Longitude", f"{lon:.6f}")
+    _kv_row(pdf, "Referencia", "Raio de 1 km em torno do ponto")
+    if email:
+        _kv_row(pdf, "E-mail", email)
+    pdf.ln(2)
+
+    _cell(pdf, "2. Condicao atual no ponto", bold=True, size=12)
+    _kv_row(pdf, "Temperatura", _fmt(summary.get("temp_now"), " C", 1))
+    _kv_row(pdf, "Condicao", str(summary.get("weather") or "-"))
+    pdf.set_font("Helvetica", "I", 9)
+    pdf.set_text_color(100, 100, 100)
+    pdf.multi_cell(0, 5, ascii_safe(
+        "No plano gratis voce ve apenas temperatura e resumo da condicao. "
+        "Umidade, vento, chuva, previsao 7 dias e historico ficam no plano completo."
+    ))
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(2)
+
+    _cell(pdf, "3. Mapa de referencia (basemap + raio 1 km)", bold=True, size=12)
+    if map_path.exists():
+        pdf.image(str(map_path), w=186)
+    pdf.ln(3)
+
+    y0 = pdf.get_y()
+    pdf.set_fill_color(11, 70, 36)
+    pdf.rect(12, y0, 186, 48, style="F")
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_xy(16, y0 + 4)
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 6, ascii_safe("O que o plano completo entrega"), ln=1)
+    pdf.set_font("Helvetica", "", 9)
+    for line in [
+        "• Previsao 7 dias (Tmin/Tmax, chuva, probabilidade, vento)",
+        "• Umidade, precipitacao e vento no instante da consulta",
+        "• Historico 30 dias + noites com Tmin <= 5 C (alerta de frio)",
+        "• Envio diario automatico no e-mail  ·  a partir de R$ 9,90/mes (1 ponto)",
+        "  5 pontos R$ 19,90  |  10 pontos R$ 29,90  |  extra +R$ 5/ponto",
+    ]:
+        pdf.set_x(16)
+        pdf.cell(0, 5, ascii_safe(line), ln=1)
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_y(y0 + 52)
+
+    _cell(pdf, "4. Fontes e aviso", bold=True, size=12)
+    pdf.set_font("Helvetica", "", 8)
+    pdf.multi_cell(0, 4.2, ascii_safe(
+        "Dados de modelo meteorologico de superficie (Open-Meteo). Mapa: OpenStreetMap. "
+        "Material orientativo para apoio operacional no ponto (sede/talhao). "
+        "Nao substitui laudo agronomico, ART, estacao oficial local nem cobertura de seguro. "
+        "Tech.luvics — Inteligencia de Ativos & IA · tech.luvics.com.br"
+    ))
 
     buf = io.BytesIO()
     pdf.output(buf)
@@ -422,59 +558,87 @@ def build_pdf_full(lat, lon, email, summary, map_path: Path) -> bytes:
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=14)
     pdf.add_page()
-    _cell(pdf, "Tech.luvics | Luvics Clima no Ponto", bold=True, size=14, center=True)
-    _cell(pdf, "RELATORIO COMPLETO (plano pago - simulacao de teste)", bold=True, size=11, center=True)
-    _cell(pdf, datetime.now().strftime("%d/%m/%Y %H:%M"), size=9, center=True)
+    now = datetime.now().strftime("%d/%m/%Y %H:%M")
+    _header_bar(
+        pdf,
+        "Tech.luvics | Luvics Clima no Ponto",
+        f"RELATORIO COMPLETO  ·  {now}  ·  plano pago (simulacao de teste)",
+    )
+
+    pdf.set_fill_color(236, 253, 245)
+    pdf.rect(12, pdf.get_y(), 186, 10, style="F")
+    pdf.set_xy(14, pdf.get_y() + 2.5)
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.set_text_color(5, 120, 80)
+    pdf.cell(0, 5, ascii_safe("PLANO COMPLETO — previsao, historico e leitura operacional no ponto."), ln=1)
+    pdf.set_text_color(0, 0, 0)
     pdf.ln(3)
 
     _cell(pdf, "1. Ponto monitorado", bold=True, size=12)
-    _cell(pdf, f"Lat {lat:.6f} | Lon {lon:.6f}")
+    _kv_row(pdf, "Latitude", f"{lat:.6f}")
+    _kv_row(pdf, "Longitude", f"{lon:.6f}")
+    _kv_row(pdf, "Referencia", "Raio de 1 km · basemap OpenStreetMap")
     if email:
-        _cell(pdf, f"E-mail: {email}")
+        _kv_row(pdf, "E-mail", email)
     pdf.ln(2)
 
     _cell(pdf, "2. Condicao atual", bold=True, size=12)
-    _cell(pdf, f"Temperatura: {summary.get('temp_now')} C")
-    _cell(pdf, f"Umidade: {summary.get('humidity')} %")
-    _cell(pdf, f"Precipitacao (agora): {summary.get('precip_now')} mm")
-    _cell(pdf, f"Vento: {summary.get('wind')} km/h")
-    _cell(pdf, f"Condicao: {summary.get('weather')}")
+    _kv_row(pdf, "Temperatura", _fmt(summary.get("temp_now"), " C", 1))
+    _kv_row(pdf, "Umidade relativa", _fmt(summary.get("humidity"), " %", 0))
+    _kv_row(pdf, "Precipitacao (agora)", _fmt(summary.get("precip_now"), " mm", 1))
+    _kv_row(pdf, "Vento", _fmt(summary.get("wind"), " km/h", 1))
+    _kv_row(pdf, "Condicao", str(summary.get("weather") or "-"))
     pdf.ln(2)
 
     _cell(pdf, "3. Previsao 7 dias", bold=True, size=12)
+    pdf.set_font("Helvetica", "B", 8)
+    pdf.set_fill_color(241, 245, 249)
+    pdf.cell(28, 6, "Data", border=1, fill=True)
+    pdf.cell(22, 6, "Tmin", border=1, fill=True)
+    pdf.cell(22, 6, "Tmax", border=1, fill=True)
+    pdf.cell(28, 6, "Chuva mm", border=1, fill=True)
+    pdf.cell(28, 6, "Prob %", border=1, fill=True)
+    pdf.cell(28, 6, "Vento", border=1, fill=True, ln=1)
+    pdf.set_font("Helvetica", "", 8)
     for d in summary.get("days") or []:
-        _cell(
-            pdf,
-            f"{d['date']}: Tmin {d['tmin']}C | Tmax {d['tmax']}C | "
-            f"Chuva {d['precip']}mm | Prob {d['pop']}% | Vento {d['wind']}km/h",
-            size=9,
-        )
+        pdf.cell(28, 6, ascii_safe(str(d.get("date") or "-")), border=1)
+        pdf.cell(22, 6, ascii_safe(_fmt(d.get("tmin"), "", 1)), border=1)
+        pdf.cell(22, 6, ascii_safe(_fmt(d.get("tmax"), "", 1)), border=1)
+        pdf.cell(28, 6, ascii_safe(_fmt(d.get("precip"), "", 1)), border=1)
+        pdf.cell(28, 6, ascii_safe(_fmt(d.get("pop"), "", 0)), border=1)
+        pdf.cell(28, 6, ascii_safe(_fmt(d.get("wind"), " km/h", 0)), border=1, ln=1)
+    pdf.ln(3)
+
+    _cell(pdf, "4. Historico 30 dias (resumo)", bold=True, size=12)
+    _kv_row(pdf, "Tmin observada", _fmt(summary.get("hist_tmin"), " C", 1))
+    _kv_row(pdf, "Tmax observada", _fmt(summary.get("hist_tmax"), " C", 1))
+    _kv_row(pdf, "Chuva acumulada", _fmt(summary.get("hist_precip"), " mm", 1))
+    _kv_row(pdf, "Noites Tmin <= 5 C", str(summary.get("nights_cold") if summary.get("nights_cold") is not None else "-"))
+    pdf.ln(1)
+    pdf.set_font("Helvetica", "I", 9)
+    pdf.set_text_color(80, 80, 80)
+    pdf.multi_cell(0, 4.5, ascii_safe(
+        "Leitura orientativa: noites frias (Tmin <= 5 C) merecem atencao em culturas sensiveis. "
+        "Combine com observacao local, vento calmo e topografia do talhao."
+    ))
+    pdf.set_text_color(0, 0, 0)
     pdf.ln(2)
 
-    _cell(pdf, "4. Historico 30 dias", bold=True, size=12)
-    _cell(pdf, f"Tmin observada: {summary.get('hist_tmin')} C")
-    _cell(pdf, f"Tmax observada: {summary.get('hist_tmax')} C")
-    _cell(pdf, f"Chuva acumulada: {summary.get('hist_precip')} mm")
-    _cell(pdf, f"Noites com Tmin <= 5C: {summary.get('nights_cold')}")
-    pdf.ln(2)
-
-    _cell(pdf, "5. Mapa (raio 1 km)", bold=True, size=12)
+    _cell(pdf, "5. Mapa do ponto (raio 1 km)", bold=True, size=12)
     if map_path.exists():
-        pdf.image(str(map_path), w=180)
+        pdf.image(str(map_path), w=186)
     pdf.ln(2)
 
-    _cell(pdf, "6. Interpretacao orientativa", bold=True, size=12)
-    pdf.multi_cell(
-        0, 4.5,
-        ascii_safe(
-            "Dados de modelo meteorologico de superficie (Open-Meteo). "
-            "Use como apoio operacional no ponto (sede/talhao). "
-            "Nao substitui laudo agronomico, ART ou cobertura de seguro. "
-            "Em risco de frio, combine com observacao local e vento calmo."
-        ),
-    )
+    _cell(pdf, "6. Interpretacao e limites", bold=True, size=12)
+    pdf.set_font("Helvetica", "", 9)
+    pdf.multi_cell(0, 4.5, ascii_safe(
+        "Dados de modelo meteorologico de superficie (Open-Meteo), interpolados para a coordenada informada. "
+        "Use como apoio operacional (sede/talhao). Nao substitui laudo agronomico, ART, estacao meteorologica "
+        "oficial in loco nem cobertura de seguro. Em risco de geada/frio, priorize observacao de campo."
+    ))
     pdf.ln(2)
-    _cell(pdf, "tech.luvics.com.br | Inteligencia de Ativos & IA", bold=True, size=9)
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.cell(0, 5, ascii_safe("Tech.luvics — Inteligencia de Ativos & IA · tech.luvics.com.br"), ln=1)
 
     buf = io.BytesIO()
     pdf.output(buf)
