@@ -8,17 +8,22 @@ Local:
   -> http://127.0.0.1:5050
 
 Render:
-  Start command: gunicorn app:app
+  Start command: gunicorn app:app --timeout 120 --workers 1 --threads 2
   Env vars: EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM
+
+IMPORTANTE: NÃO coloque senha de app no código. Use só Environment Variables no Render.
+Se a senha vazou no GitHub, revogue no Google e gere outra.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import io
 import math
 import os
 import smtplib
-from datetime import datetime, timedelta
+import traceback
+from datetime import datetime, timedelta, timezone
 from email import encoders
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
@@ -30,7 +35,6 @@ from flask import Flask, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
 from fpdf import FPDF
 from PIL import Image, ImageDraw
-from staticmap import CircleMarker, Line, StaticMap
 
 ROOT = Path(__file__).parent
 STATIC = ROOT / "static"
@@ -38,14 +42,13 @@ OUTPUT = ROOT / "output"
 OUTPUT.mkdir(exist_ok=True)
 
 # =============================================================================
-# E-MAIL — no Render use Environment Variables (mais seguro).
-# Localmente pode preencher aqui OU usar env.
+# E-MAIL — use APENAS Environment Variables no Render (nunca hardcode senha).
 # =============================================================================
 EMAIL_CONFIG = {
-    "HOST": "",
-    "PORT": ,
-    "USER": "",  # ex: seu@gmail.com
-    "PASS": "",  # senha de app
+    "HOST": "smtp.gmail.com",
+    "PORT": 587,
+    "USER": "",  # deixe vazio; preencha via EMAIL_USER no Render
+    "PASS": "",  # deixe vazio; preencha via EMAIL_PASS no Render
     "FROM": "",
 }
 # =============================================================================
@@ -53,7 +56,6 @@ EMAIL_CONFIG = {
 USER_AGENT = "TechLuvics-ClimaNoPonto/1.0 (contato@techluvics.com.br)"
 
 app = Flask(__name__, static_folder=str(STATIC), static_url_path="")
-# Libera o front no GitHub Pages / dominio tech.luvics
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 
@@ -74,7 +76,7 @@ def ascii_safe(text) -> str:
         "É": "E", "Ê": "E", "Í": "I",
         "Ó": "O", "Ô": "O", "Õ": "O", "Ú": "U", "Ç": "C",
         "•": "-", "·": "-",
-        "“": '"', "”": '"', "‘": "'", "’": "'",
+        """: '"', """: '"', "'": "'", "'": "'",
     }
     for a, b in repl.items():
         s = s.replace(a, b)
@@ -100,7 +102,7 @@ def email_configured() -> bool:
 def send_report_email(to_email: str, pdf_bytes: bytes, filename: str, mode: str, lat: float, lon: float) -> None:
     host, port, user, password, from_addr = _email_settings()
     if not user or not password:
-        raise RuntimeError("E-mail nao configurado. Defina EMAIL_USER e EMAIL_PASS no Render ou no EMAIL_CONFIG.")
+        raise RuntimeError("E-mail nao configurado. Defina EMAIL_USER e EMAIL_PASS no Render.")
     if not to_email or "@" not in to_email:
         raise RuntimeError("E-mail do destinatario invalido.")
 
@@ -140,7 +142,7 @@ def send_report_email(to_email: str, pdf_bytes: bytes, filename: str, mode: str,
     part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
     msg.attach(part)
 
-    with smtplib.SMTP(host, port, timeout=30) as server:
+    with smtplib.SMTP(host, port, timeout=20) as server:
         server.ehlo()
         server.starttls()
         server.ehlo()
@@ -171,12 +173,13 @@ def fetch_climate(lat: float, lon: float) -> dict:
             "timezone": "America/Sao_Paulo",
             "forecast_days": 7,
         },
-        timeout=30,
+        timeout=20,
+        headers={"User-Agent": USER_AGENT},
     )
     fc.raise_for_status()
     forecast = fc.json()
 
-    end = datetime.utcnow().date() - timedelta(days=1)
+    end = datetime.now(timezone.utc).date() - timedelta(days=1)
     start = end - timedelta(days=30)
     hist = {}
     try:
@@ -190,7 +193,8 @@ def fetch_climate(lat: float, lon: float) -> dict:
                 "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum",
                 "timezone": "America/Sao_Paulo",
             },
-            timeout=30,
+            timeout=20,
+            headers={"User-Agent": USER_AGENT},
         )
         if ha.status_code == 200:
             hist = ha.json()
@@ -239,10 +243,31 @@ def summarize(data: dict) -> dict:
     return s
 
 
-def make_map_png(lat: float, lon: float, radius_m: int = 1000) -> Path:
-    path = OUTPUT / f"map_{lat:.4f}_{lon:.4f}_{radius_m}.png"
+def _placeholder_map(lat: float, lon: float, radius_m: int, path: Path) -> Path:
+    """Mapa local sem rede — evita timeout no Render free."""
+    img = Image.new("RGB", (800, 500), (241, 245, 249))
+    d = ImageDraw.Draw(img)
+    d.rectangle([0, 0, 799, 499], outline=(15, 23, 42), width=2)
+    cx, cy = 400, 250
+    r_px = 140
+    d.ellipse([cx - r_px, cy - r_px, cx + r_px, cy + r_px], outline=(11, 70, 36), width=3)
+    d.ellipse([cx - 8, cy - 8, cx + 8, cy + 8], fill=(225, 29, 72))
+    for x in range(50, 800, 50):
+        d.line([(x, 0), (x, 500)], fill=(226, 232, 240), width=1)
+    for y in range(50, 500, 50):
+        d.line([(0, y), (800, y)], fill=(226, 232, 240), width=1)
+    d.rectangle([10, 10, 420, 58], fill=(255, 255, 255), outline=(20, 20, 20))
+    d.text((18, 18), f"Raio {radius_m} m | {lat:.5f}, {lon:.5f}", fill=(0, 0, 0))
+    d.text((18, 38), "Mapa de referencia (sem tiles externos)", fill=(100, 116, 139))
+    img.save(str(path))
+    return path
+
+
+def _staticmap_render(lat: float, lon: float, radius_m: int, path: Path) -> Path:
+    from staticmap import CircleMarker, Line, StaticMap
+
     m = StaticMap(800, 500, url_template="https://tile.openstreetmap.org/{z}/{x}/{y}.png")
-    n = 64
+    n = 32
     pts = []
     for i in range(n + 1):
         ang = 2 * math.pi * i / n
@@ -252,17 +277,27 @@ def make_map_png(lat: float, lon: float, radius_m: int = 1000) -> Path:
     for i in range(len(pts) - 1):
         m.add_line(Line([pts[i], pts[i + 1]], "#0B4624", 2))
     m.add_marker(CircleMarker((lon, lat), "#E11D48", 14))
-    try:
-        img = m.render(zoom=14)
-    except Exception:
-        img = Image.new("RGB", (800, 500), (240, 240, 240))
-        d = ImageDraw.Draw(img)
-        d.text((20, 20), f"Mapa indisponivel | {lat:.5f}, {lon:.5f}", fill=(0, 0, 0))
+    img = m.render(zoom=13)
     draw = ImageDraw.Draw(img)
     draw.rectangle([10, 10, 280, 48], fill=(255, 255, 255), outline=(20, 20, 20))
     draw.text((18, 18), f"Raio 1 km | {lat:.5f}, {lon:.5f}", fill=(0, 0, 0))
     img.save(str(path))
     return path
+
+
+def make_map_png(lat: float, lon: float, radius_m: int = 1000) -> Path:
+    path = OUTPUT / f"map_{lat:.4f}_{lon:.4f}_{radius_m}.png"
+    use_static = os.environ.get("USE_STATICMAP", "0").strip().lower() in ("1", "true", "yes")
+
+    if use_static:
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(_staticmap_render, lat, lon, radius_m, path)
+                return fut.result(timeout=12)
+        except Exception:
+            return _placeholder_map(lat, lon, radius_m, path)
+
+    return _placeholder_map(lat, lon, radius_m, path)
 
 
 def _cell(pdf, text, ln=1, bold=False, size=10, center=False):
@@ -439,9 +474,13 @@ def api_report():
         mode = "free"
 
     try:
-        raw = fetch_climate(lat, lon)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            fut_climate = ex.submit(fetch_climate, lat, lon)
+            fut_map = ex.submit(make_map_png, lat, lon, 1000)
+            raw = fut_climate.result(timeout=25)
+            map_path = fut_map.result(timeout=15)
+
         summary = summarize(raw)
-        map_path = make_map_png(lat, lon, 1000)
         if mode == "free":
             pdf_bytes = build_pdf_free(lat, lon, email, summary, map_path)
             fname = "luvics_clima_GRATIS.pdf"
@@ -449,7 +488,10 @@ def api_report():
             pdf_bytes = build_pdf_full(lat, lon, email, summary, map_path)
             fname = "luvics_clima_COMPLETO.pdf"
 
-        (OUTPUT / f"{mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf").write_bytes(pdf_bytes)
+        try:
+            (OUTPUT / f"{mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf").write_bytes(pdf_bytes)
+        except Exception:
+            pass
 
         emailed = False
         email_error = None
@@ -464,7 +506,7 @@ def api_report():
                     send_report_email(email, pdf_bytes, fname, mode, lat, lon)
                     emailed = True
                 except Exception as mail_err:
-                    email_error = str(mail_err)
+                    email_error = str(mail_err)[:200]
 
         resp = send_file(
             io.BytesIO(pdf_bytes),
@@ -475,11 +517,12 @@ def api_report():
         resp.headers["X-Luvics-Emailed"] = "1" if emailed else "0"
         if email_error:
             resp.headers["X-Luvics-Email-Error"] = email_error[:200]
-        # Expoe headers customizados ao browser (CORS)
         resp.headers["Access-Control-Expose-Headers"] = "X-Luvics-Emailed, X-Luvics-Email-Error"
         return resp
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        tb = traceback.format_exc()
+        app.logger.error("report failed: %s\n%s", e, tb)
+        return jsonify({"error": str(e), "type": type(e).__name__}), 500
 
 
 @app.get("/")
@@ -487,16 +530,11 @@ def index():
     return send_from_directory(STATIC, "index.html")
 
 
-#if __name__ == "__main__":
-#    port = int(os.environ.get("PORT", 5050))
-#    print("=" * 60)
-#    print("Luvics Clima no Ponto")
-#    print(f"Local: http://127.0.0.1:{port}")
-#    print(f"E-mail configurado: {email_configured()}")
-#    print("=" * 60)
-#    app.run(host="0.0.0.0", port=port, debug=False)
-
 if __name__ == "__main__":
-    import os
     port = int(os.environ.get("PORT", 5050))
+    print("=" * 60)
+    print("Luvics Clima no Ponto")
+    print(f"Local: http://127.0.0.1:{port}")
+    print(f"E-mail configurado: {email_configured()}")
+    print("=" * 60)
     app.run(host="0.0.0.0", port=port, debug=False)
